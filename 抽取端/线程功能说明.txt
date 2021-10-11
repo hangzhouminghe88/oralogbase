@@ -1,0 +1,334 @@
+一、线程类型:
+主线程、抽取线程、合并线程、消费线程
+
+二、线程功能
+1、主线程
+功能:
+初始化程序;
+创建抽取线程、合并线程、消费线程，等待他们结束后回收资源。
+线程数:
+主线程只有一个。
+线程主函数:
+Lgc_main.cpp 中的main函数
+
+2、抽取线程
+功能:
+解析日志，得出结果;
+将结果放到结果队列中。
+这里的结果是以事务来组织的，事务中包含一个或者多个dmlRow。
+结果队列也就是按照CommitSCN排序了的事务队列。
+每个抽取线程都有自己的结果队列。
+线程数:
+抽取线程数和oracle rac的节点数对应。
+线程主函数:
+Lgc_ExtractThread.cpp中的ExtractThreadFunc函数
+
+3、合并线程
+功能: 
+对多个抽取线程得出的多个事务队列进行合并排序得出一个事务队列。
+合并后的事务队列全局按照commitSCN号排序。
+合并后的事务队列全局只有一个。
+线程数:
+合并线程只有一个。
+线程主函数:
+Lgc_MergeThread.cpp 中的MergeThreadFunc函数
+
+4、消费线程
+功能:
+从合并后的事务队列中pop出事务，然后把它消费掉。
+事务的消费过程主要是: 将事务数据经过一定的转化，然后存储到中间文件中。
+线程数: 
+消费线程只有一个。
+线程主函数:
+Lgc_ConsumeThread.cpp中的consumeThreadFunc函数
+
+
+三、线程主要代码
+1、主线程
+int main(int argc, char* argv[])
+{
+	//初始化程序
+	lgc_extract_init();
+	
+	//创建抽取线程，threads对应要创建的抽取线程数
+	for(int threadId = 1; threadId <= threads; threadId++){
+		iFuncRet = pthread_create(&extractTidArray[threadId],
+			                      NULL, 
+			                      extractThreadFunc, 
+			                      &extractThreadArgArray[threadId]);
+	}
+	
+	//创建合并线程
+	iFuncRet = pthread_create(&mergeTid, 
+		                      NULL, 
+		                      mergeThreadFunc, 
+		                      &mergeThreadArg);
+	
+	//创建消费线程
+	iFuncRet = pthread_create(&consumeTid,
+		                      NULL, 
+		                      consumeThreadFunc, 
+		                      &consumeThreadArg);
+
+	//主线程等待
+	void* tret;
+	for(int threadId = 1; threadId <= threads; threadId++){
+		iFuncRet = pthread_join(extractTidArray[threadId],
+                                        &tret);
+	}
+	iFuncRet = pthread_join(mergeTid,
+                                &tret);
+	iFuncRet = pthread_join(consumeTid, 
+                                &tret);
+	
+	return 0;
+}
+
+
+2、抽取线程
+void* extractThreadFunc(void* pExtractThreadArg)
+{
+	//创建RedoFileInput
+	pRedoFileInput = LGC_RedoFileInput::createRedoFileInput(threadId, startSCN, pQuery);
+	
+	//迭代地从RedoFileInput中读取出RedoFile
+	while(true){
+		//获取下一个RedoFile
+		iFuncRet = pRedoFileInput->getNextRedoFile(&pRedoFile);
+		
+		//创建RedoRecordInput,用于从RedoFile中读取出RedoRecord
+		pRedoRecordInput = LGC_RedoRecordInput::createRedoRecordInput(pPrevRedoRecordInput, pRedoFile);
+		
+		//迭代地从RedoRecordInput中读取出RedoRecord
+		while( 1 == 
+			    (recordsReaded = pRedoRecordInput->getNextRedoRecord(&pRedoRecord)) )
+		{
+			
+			//创建RecordHanlder
+			pRecordHandler = new LGC_RecordHandler(pRedoRecord);
+			
+			//用RecordHandler处理Record
+			iFuncRet = pRecordHandler->handle();
+			
+		}//end while ...
+	}//end while true
+
+	return NULL;
+}
+
+int LGC_RecordHandler::handle()
+{	
+	//创建ChangeInput
+	pChangeInput = LGC_ChangeInput::createChangeInput(m_pRedoRecord);
+	
+	//迭代地从ChangeInput中读出Change
+	while(1 == 
+		    (recordsReaded = pChangeInput->getNextChange(&pChange)))
+	{
+		//创建ChangeHandler
+		pChangeHandler = new LGC_ChangeHandler(pChange);
+		
+		//用ChangeHandler处理Change
+		iFuncRet = pChangeHandler->handle();
+	}
+
+	return 0;
+}
+
+int LGC_ChangeHandler::handle()
+{
+	
+	//过滤掉没必要解析的Change
+	if( true == m_pChange->isNeedAddToTrsct() ){
+		//将chang提交给事务
+		iFuncRet = this->addChangeToTrsct();
+	}
+
+	return 0;
+}
+
+int LGC_ChangeHandler::addChangeToTrsct()
+{
+	
+	//获取TransactionMgr, 每个抽取线程都有自己的TransactionMgr
+	LGC_TransactionMgr* pTransactionMgr = LGC_TransactionMgr::getInstance(threadId);
+	
+	//如果新开始一个事务，则添加到事务管理器中
+	if(isBeginTrsctChange){
+		iFuncRet = pTransactionMgr->addTransaction(transactionId);
+	}
+	
+	//从事务管理器中获取事务
+	LGC_Transaction* pTransaction = pTransactionMgr->getTransaction(transactionId);
+	
+	//向相应的事务中添加change
+	iFuncRet = pTransaction->addChange(&m_pChange);
+	
+	//如果事务已经结束，则处理它
+	if( pTransaction->isTrsctEnd() ){
+		LGC_TransactionHandler::handle(pTransaction) < 0);
+	}
+
+	//success
+	return 1;
+}
+
+
+
+int LGC_Transaction::addChange(LGC_Change** ppChange)
+{
+	int iFuncRet = 0;
+
+	if((*ppChange)->isBeginTrsctChange()){//事务开始型Change
+		//处理事务开始型change
+		this->handleBeginTChange((LGC_BeginTChange*)*ppChange);
+
+	}else if((*ppChange)->isEndTrsctChange()){//事务结束型change
+		
+		//处理事务结束型change
+		this->handleEndTChange((LGC_EndTChange*)*ppChange) 
+	}else{//普通dml型change
+		
+		//将change添加到dmlChangeList
+		iFuncRet = this->addChangeToDmlChangeList(ppChange);
+		
+		//如果dmlChangeList结束了，则处理它
+		if( this->dmlChangeListIsEnd() ){
+			//处理dmlChangeList
+			this->handleDmlChangeList();
+		}
+	}
+
+	return 1;
+}
+
+
+int  LGC_Transaction::handleDmlChangeList()
+{
+	//过滤掉不需要解析的dmlChangeList
+	if(m_pDmlChangeList->isNeedAnalyse()){
+		//解析dmlChangeList, 生成dmlData
+		m_pDmlChangeList->generateDmlData(m_pDmlRowsOutput);
+	}
+
+	return 0;
+}
+
+int LGC_TransactionHandler::handle(LGC_Transaction* pTransaction)
+{
+	//从活动事务列表中删除
+	LGC_TransactionHandler::delFromActiveTList(pTransaction);
+
+	if(pTransaction->isNeedApply()){//事务需要分析
+		//将事务添加到分析结果队列中
+		LGC_TransactionHandler::addTrsctToQueue(pTransaction);
+	}
+	
+	//success
+	return 0;
+}
+
+3. 合并线程
+/*
+*合并线程的线程函数
+*/
+void* mergeThreadFunc(void* pMergeThreadArg)
+{
+
+	
+	//合并结果队列
+	BYTE8			minCommitSCN            = MAXSCN;
+	unsigned short	threadIdOfMinCommitSCN	= 0;
+	while(true){
+		//寻找最小commitSCN号所在的TOriginalQueue
+		for(int threadId=1; threadId <= threads; threadId++){
+			BYTE8 commitSCN = getMinCommitSCNOfOriQueue(trsctOriQueueArray,threads, threadId);
+			if(minCommitSCN > commitSCN){
+				minCommitSCN = commitSCN;
+				threadIdOfMinCommitSCN = threadId;
+			}
+		}
+		
+		//取出最小CommitSCN对应的事务
+		pTransaction = popFromOriQueue(trsctOriQueueArray, threads, threadIdOfMinCommitSCN);
+		//将最小CommitSCN对应的事务push到合并队列中
+		pushToMergedQueue(trsctMergedQueue,pTransaction);
+		pTransaction = NULL;
+	}
+	
+	//never to here
+	lgc_errMsg("never to here \n");
+	return NULL;
+}
+
+
+4. 消费线程
+/*
+*消费线程的线程函数
+*/
+void* consumeThreadFunc(void* pConsumeThreadArg)
+{
+	
+	while(true){
+		//从TMergedQueue中pop出事务
+		pTransaction = popFromMergedQueue(pTMergedQueue);
+		
+		//把事务消费掉
+		consumeTransaction(pTransaction);
+	}
+	return NULL;
+}
+
+/*
+*消费掉事务
+*/
+int consumeTransaction(LGC_Transaction* pTransaction)
+{	
+	//创建事务消费者
+	LGC_TConsumer* pTConsumer = LGC_TConsumer::createTConsumer(pTransaction);
+	
+	//用事务消费者把事务消费掉
+	pTConsumer->consume();
+
+	return 0;
+}
+
+/*
+*消费事务: 解析事务数据，并输出
+*/
+int LGC_TConsumer::consume()
+{
+  
+	
+	//解析事务开始的数据
+	this->parseTrsctBegin(pTrsctBegin, pMediaFileOutput);
+	
+	//解析事务中的dmlRowList
+	this->parseTrsctDmlRowList(pDmlRowList, pMediaFileOutput);
+
+	//解析事务结束时的数据
+	this->parseTrsctEnd(pTrsctEnd, pMediaFileOutput);
+	
+	//success
+	return 0;
+}
+
+/*
+*解析事务中的dmlRowList, 并输出
+*/
+int LGC_TConsumer::parseTrsctDmlRowList(const list<LGC_DmlRow*> *pDmlRowList, LGC_MediaFileOutput* pMediaFileOutput)
+{
+	//获取DmlRowParser对象
+	LGC_DmlRowParser* pDmlRowParser = LGC_DmlRowParser::getInstance();
+	
+	//遍历dmlRowList
+	for(it = pDmlRowList->begin(); it != pDmlRowList->end(); it++){
+		
+		//解析dmlRow
+		const LGC_DmlRow* pDmlRow = *it;
+		pDmlRowParser->parse(pDmlRow, pMediaFileOutput);
+	}
+	
+	//success
+	return 0;
+}

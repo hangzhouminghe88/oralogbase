@@ -1,0 +1,14 @@
+//////////////////////////////////////////////////////////////////////////
+//  [5/12/2012 wqy]  定义一些常用的
+//////////////////////////////////////////////////////////////////////////
+
+#ifndef _DEFINES_H
+#define _DEFINES_H
+
+
+typedef unsigned char BYTE;
+typedef unsigned short int WORD;
+typedef unsigned int DWORD;
+typedef unsigned long long BYTE8;
+
+#endif
